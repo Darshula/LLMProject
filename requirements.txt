@@ -6,3 +6,6 @@ langchain
 langchain-community
 langchain-openai
 openai
+pinecone
+cassandra-driver
+pymupdf

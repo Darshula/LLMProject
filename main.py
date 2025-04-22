@@ -1,236 +1,189 @@
-# # main.py
-# import os
-# import re
-# import uuid
-# import requests
-# from bs4 import BeautifulSoup
-# import openai
-# import streamlit as st
-# from dotenv import load_dotenv
-
-# from text2sql import text2sql, run_nl_query
-
-# load_dotenv()
-# openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# st.title("🧠 Smart Assistant: News or SQL")
-# st.sidebar.header("🔗 Optional: Enter News URLs")
-# urls = [st.sidebar.text_input(f"URL {i+1}") for i in range(3)]
-
-# # Sidebar SQL uploader
-# st.sidebar.header("📥 Optional: Upload SQL Schema File")
-# db_file = st.sidebar.file_uploader("Upload .sql file", type=['sql'])
-# if db_file:
-#     db_dir = os.path.join(os.getcwd(), "uploads", "db")
-#     os.makedirs(db_dir, exist_ok=True)
-#     db_path = os.path.join(db_dir, str(uuid.uuid4()) + "_" + db_file.name)
-#     with open(db_path, "wb") as f:
-#         f.write(db_file.getvalue())
-#     text2sql(db_path)
-
-# # Common input field for a question
-# query = st.text_input("💬 Enter a prompt:")
-
-# # One common action button
-# if st.button("🔍 Process"):
-#     # CASE 1: URLs provided → summarize articles
-#     if any(url.strip() for url in urls):
-#         def fetch_text_from_url(url):
-#             try:
-#                 response = requests.get(url)
-#                 response.encoding = 'utf-8'
-#                 soup = BeautifulSoup(response.content, 'html.parser')
-#                 main = soup.find('main') or soup
-#                 return '\n'.join(p.text for p in main.find_all('p'))
-#             except Exception as e:
-#                 st.error(f"Error reading {url}: {e}")
-#                 return ""
-
-#         def clean_text(text):
-#             return re.sub(r'[^\x00-\x7F]+', ' ', text)
-
-#         all_texts = []
-#         for url in urls:
-#             if url.strip():
-#                 raw = fetch_text_from_url(url)
-#                 cleaned = clean_text(raw)
-#                 chop = int(0.2 * len(cleaned))
-#                 trimmed = cleaned[int(chop * 1.2):-chop]
-#                 all_texts.append(trimmed)
-
-#         if not all_texts:
-#             st.error("❌ Could not extract valid text from URLs.")
-#         elif not query:
-#             st.warning("Please enter a prompt for summarization.")
-#         else:
-#             context = " ".join(all_texts)
-#             prompt = f"""You are writing condensed summaries of news articles as a paragraph containing 20 lines with as much detail as possible. Now, you need to {query}. Use only the following information:
-
-# {context}
-
-# Respond as a single informative paragraph with relevant details, no fluff."""
-#             try:
-#                 response = openai.chat.completions.create(
-#                     model="gpt-3.5-turbo",
-#                     messages=[
-#                         {"role": "system", "content": "You are a helpful assistant that summarizes news articles."},
-#                         {"role": "user", "content": prompt}
-#                     ],
-#                     temperature=0.7,
-#                     max_tokens=500
-#                 )
-#                 answer = response.choices[0].message.content
-#                 st.subheader("📰 Answer:")
-#                 st.write(answer)
-#             except Exception as e:
-#                 st.error(f"OpenAI API Error: {e}")
-
-#     # CASE 2: No URLs → assume SQL question
-#     elif st.session_state.get("db_ready") and query:
-#         output = run_nl_query(query)
-#         if "error" in output:
-#             st.error(output["error"])
-#         else:
-#             st.code(output["query"], language="sql")
-#             st.write("📊 Query Result:")
-#             st.write(output["result"])
-
-#     # CASE 3: No input
-#     else:
-#         st.warning(
-#             "❗ Please enter a prompt and either URLs or upload a database.")
-
-
-# main.py
 import os
-import re
 import uuid
+import re
 import requests
+import textwrap
+import time
 from bs4 import BeautifulSoup
-import openai
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from openai import OpenAI
 import streamlit as st
 from dotenv import load_dotenv
-
+from pinecone import Pinecone, ServerlessSpec
+from cassandra.cluster import Cluster
 from text2sql import text2sql, run_nl_query
 from pdf_parser import process_pdf
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
-st.title("🧠 Smart Assistant: News, SQL, PDF")
-st.sidebar.header("🔗 Optional: Enter News URLs")
+@st.cache_resource
+def get_openai():
+    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+@st.cache_resource
+def get_pinecone_index():
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"), environment=os.getenv("PINECONE_ENVIRONMENT","us-west1-gcp"))
+    idx = os.getenv("PINECONE_INDEX","sagefusion-index")
+    env = os.getenv("PINECONE_ENVIRONMENT","us-west1-gcp")
+    region, cloud = env.split("-",1)
+    if idx not in pc.list_indexes().names():
+        pc.create_index(name=idx, dimension=1536, metric="cosine", spec=ServerlessSpec(cloud=cloud,region=region))
+    return pc.Index(name=idx)
+
+@st.cache_resource
+def get_cassandra_session():
+    cluster = Cluster([os.getenv("CASSANDRA_HOST","127.0.0.1")],port=int(os.getenv("CASSANDRA_PORT",9042)))
+    sess = cluster.connect()
+    ks = os.getenv("CASSANDRA_KEYSPACE","sagefusion")
+    sess.execute(f"CREATE KEYSPACE IF NOT EXISTS {ks} WITH replication={{'class':'SimpleStrategy','replication_factor':'1'}}")
+    sess.set_keyspace(ks)
+    sess.execute("CREATE TABLE IF NOT EXISTS documents(doc_id text PRIMARY KEY, source text, content text)")
+    return sess
+
+client = get_openai()
+index = get_pinecone_index()
+session = get_cassandra_session()
+
+if "seen_urls" not in st.session_state:
+    st.session_state.seen_urls = set()
+
+def chunk_text(text, chunk_size=200, overlap=50):
+    tokens, chunks, i = text.split(), [], 0
+    while i < len(tokens):
+        end = min(i + chunk_size, len(tokens))
+        chunks.append(" ".join(tokens[i:end]))
+        if end == len(tokens):
+            break
+        i = end - overlap
+    return chunks
+
+def fetch_and_clean(url):
+    r = requests.get(url, timeout=5)
+    r.encoding = "utf-8"
+    soup = BeautifulSoup(r.content, "html.parser")
+    body = soup.body or soup
+    text = body.get_text(separator=" ")
+    return re.sub(r"[^\x00-\x7F]+"," ", text).strip()
+
+def get_embedding(text):
+    resp = client.embeddings.create(model="text-embedding-ada-002", input=[text])
+    return resp.data[0].embedding
+
+def ingest_chunks(chunks, source):
+    upserts = []
+    for chunk in chunks:
+        doc_id = str(uuid.uuid4())
+        emb = get_embedding(chunk)
+        upserts.append((doc_id, emb, {"source":source}))
+        session.execute("INSERT INTO documents(doc_id, source, content) VALUES (%s,%s,%s)",(doc_id,source,chunk))
+    index.upsert(vectors=upserts)
+
+def rag_retrieve_details(query, top_k=3):
+    q_emb = get_embedding(query)
+    resp = index.query(vector=q_emb, top_k=top_k, include_metadata=True)
+    matches = sorted(resp.matches, key=lambda m: m.score, reverse=True)
+    results = []
+    for m in matches:
+        row = session.execute("SELECT content FROM documents WHERE doc_id=%s",(m.id,)).one()
+        if row:
+            results.append({"score":m.score,"text":row.content})
+    return results
+
+def precision_at_k(retrieved, relevant, k=3):
+    return len(set(retrieved[:k]) & set(relevant)) / k
+
+def recall_at_k(retrieved, relevant, k=3):
+    return len(set(retrieved[:k]) & set(relevant)) / len(relevant) if relevant else 0.0
+
+def mrr(retrieved, relevant):
+    for i,doc in enumerate(retrieved, start=1):
+        if doc in relevant:
+            return 1/i
+    return 0.0
+
+def faithfulness(answer, references):
+    ans_tokens = set(answer.split())
+    ref_tokens = set().union(*[set(r.split()) for r in references])
+    return len(ans_tokens & ref_tokens)/len(ans_tokens) if ans_tokens else 0.0
+
+st.title("FusionSage")
+
+st.sidebar.header("Enter webpage URLs")
 urls = [st.sidebar.text_input(f"URL {i+1}") for i in range(3)]
 
-# Upload SQL
-st.sidebar.header("📥 Optional: Upload SQL Schema File")
-db_file = st.sidebar.file_uploader("Upload .sql file", type=['sql'])
+st.sidebar.header("Upload SQL schema (.sql)")
+db_file = st.sidebar.file_uploader("", type="sql")
 if db_file:
-    db_dir = os.path.join(os.getcwd(), "uploads", "db")
-    os.makedirs(db_dir, exist_ok=True)
-    db_path = os.path.join(db_dir, str(uuid.uuid4()) + "_" + db_file.name)
-    with open(db_path, "wb") as f:
+    path = os.path.join("uploads","db",f"{uuid.uuid4()}_{db_file.name}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path,"wb") as f:
         f.write(db_file.getvalue())
-    text2sql(db_path)
+    text2sql(path)
 
-# Upload PDF
-st.sidebar.header("📄 Optional: Upload a PDF File")
-pdf_file = st.sidebar.file_uploader("Upload PDF", type=["pdf"])
-if pdf_file:
-    process_pdf(pdf_file)
+st.sidebar.header("Upload PDF")
+pdf_file = st.sidebar.file_uploader("", type="pdf")
+if pdf_file and "pdf_file" not in st.session_state:
+    pdf_text = process_pdf(pdf_file)
+    ingest_chunks(chunk_text(pdf_text),"pdf")
+    st.session_state.pdf_file = pdf_file
 
-# Common prompt input
-query = st.text_input("💬 Enter a prompt/question:")
+mode = st.sidebar.selectbox("Select query mode",("Documents (Web/PDF)","Database"))
+query = st.text_input("Enter your question:")
 
-# Single action button
-if st.button("🔍 Process"):
-    # CASE 1: Process news
-    if any(url.strip() for url in urls):
-        def fetch_text_from_url(url):
-            try:
-                response = requests.get(url)
-                response.encoding = 'utf-8'
-                soup = BeautifulSoup(response.content, 'html.parser')
-                main = soup.find('main') or soup
-                return '\n'.join(p.text for p in main.find_all('p'))
-            except Exception as e:
-                st.error(f"Error reading {url}: {e}")
-                return ""
-
-        def clean_text(text):
-            return re.sub(r'[^\x00-\x7F]+', ' ', text)
-
-        all_texts = []
-        for url in urls:
-            if url.strip():
-                raw = fetch_text_from_url(url)
-                cleaned = clean_text(raw)
-                chop = int(0.2 * len(cleaned))
-                trimmed = cleaned[int(chop * 1.2):-chop]
-                all_texts.append(trimmed)
-
-        if not all_texts:
-            st.error("❌ Could not extract valid text from URLs.")
-        elif not query:
-            st.warning("Please enter a prompt for summarization.")
+if st.button("Process"):
+    for u in urls:
+        if u.strip() and u not in st.session_state.seen_urls:
+            txt = fetch_and_clean(u)
+            if txt:
+                ingest_chunks(chunk_text(txt),"webpage")
+            st.session_state.seen_urls.add(u)
+    if mode=="Database":
+        if st.session_state.get("db_ready") and query:
+            start_sql = time.time()
+            output = run_nl_query(query)
+            sql_time = time.time()-start_sql
+            if "error" in output:
+                st.error(output["error"])
+            else:
+                sql = output["query"]
+                result = output["result"]
+                st.code(sql,language="sql")
+                st.markdown(f"- **SQL gen+exec time:** {sql_time:.2f}s")
+                row_count = len(result)
+                st.markdown(f"- **Rows returned:** {row_count}")
+                if row_count==1 and len(result[0])==1:
+                    cnt = result[0][0]
+                    m = re.search(r'COUNT\(\"?(\w+)\"?\)',sql,re.IGNORECASE)
+                    noun = m.group(1).lower().rstrip('id').rstrip('s') if m else "items"
+                    st.write(f"There are {cnt} {noun}s.")
+                else:
+                    summary_prompt = f"SQL:\n{sql}\nResult:\n{result}\nQuestion: {query}\nSummarize the answer:"
+                    start_ans = time.time()
+                    resp = client.chat.completions.create(model="gpt-3.5-turbo",messages=[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":summary_prompt}],temperature=0.5,max_tokens=200)
+                    ans_time = time.time()-start_ans
+                    st.markdown(f"- **Answer gen time:** {ans_time:.2f}s")
+                    st.write(resp.choices[0].message.content)
         else:
-            context = " ".join(all_texts)
-            prompt = f"""You are writing condensed summaries of news articles as a paragraph containing 20 lines with as much detail as possible. Now, you need to {query}. Use only the following information:
-
-{context}
-
-Respond as a single informative paragraph with relevant details, no fluff."""
-            try:
-                response = openai.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant that summarizes news articles."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.7,
-                    max_tokens=500
-                )
-                answer = response.choices[0].message.content
-                st.subheader("📰 News Answer:")
-                st.write(answer)
-            except Exception as e:
-                st.error(f"OpenAI API Error: {e}")
-
-    # CASE 2: SQL query
-    elif st.session_state.get("db_ready") and query:
-        output = run_nl_query(query)
-        if "error" in output:
-            st.error(output["error"])
-        else:
-            st.code(output["query"], language="sql")
-            st.write("📊 Query Result:")
-            st.write(output["result"])
-
-    # CASE 3: PDF question
-    elif st.session_state.get("pdf_ready") and query:
-        context = st.session_state.pdf_text
-        prompt = f"""You are reading a PDF document. Now, please answer this question using only the information from the document:
-
-{context}
-
-Question: {query}
-Answer:"""
-
-        try:
-            response = openai.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that answers questions from a PDF document."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.5,
-                max_tokens=500
-            )
-            pdf_answer = response.choices[0].message.content
-            st.subheader("📄 PDF Answer:")
-            st.write(pdf_answer)
-        except Exception as e:
-            st.error(f"OpenAI PDF Error: {e}")
-
+            st.error("Please upload a .sql file and enter a question.")
     else:
-        st.warning(
-            "❗ Please enter a prompt and either URLs, a database, or a PDF file.")
+        matches = rag_retrieve_details(query,top_k=3)
+        retrieved = [m["text"] for m in matches]
+        relevant = retrieved[:1]
+        ctx = "\n\n".join(retrieved)
+        prompt_text = f"Use ONLY the passages below:\n\n{ctx}\n\nQuestion: {query}\nAnswer:"
+        resp = client.chat.completions.create(model="gpt-3.5-turbo",messages=[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":prompt_text}],temperature=0.7,max_tokens=500)
+        answer = resp.choices[0].message.content
+        reference = [relevant[0].split()]
+        candidate = answer.split()
+        bleu = sentence_bleu(reference,candidate,smoothing_function=SmoothingFunction().method4)
+        answer_relevance = matches[0]["score"] if matches else 0.0
+        faith = faithfulness(answer, [m["text"] for m in matches])
+        st.subheader("Answer")
+        st.write(answer)
+        st.subheader("Evaluation Metrics")
+        st.markdown(f"- **Retrieval (K=3):**\n  - Precision@3: {precision_at_k(retrieved,relevant,3):.4f}  \n  - Recall@3:    {recall_at_k(retrieved,relevant,3):.4f}  \n  - MRR:         {mrr(retrieved,relevant):.4f}\n\n- **Answer Quality:**\n  - BLEU:               {bleu:.4f}  \n  - Answer Relevance:   {answer_relevance:.4f}  \n  - Faithfulness:       {faith:.4f}")
+        st.subheader("Relevant Documents")
+        for m in matches:
+            with st.container():
+                st.markdown(f"**Score: {m['score']:.4f}**")
+                st.code(m["text"])
